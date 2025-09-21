@@ -1,4 +1,4 @@
-#include "DDCExecutor.h"  // 250919 03:36 //
+#include "DDCExecutor.h"  // 250919 03:36
 
 #include <cstring>
 #include <iostream>
@@ -342,7 +342,7 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
         //auto c10 = clk::now();
         const int16_t* src16 = reinterpret_cast<const int16_t*>(batch.data());
         for (size_t k = 0; k < required_shorts; ++k) {
-            input_iq[k] = static_cast<int32_t>(src16[k]) << 16;
+            input_iq[k] = static_cast<int32_t>(src16[k]) << 15;
         }
         //auto c11 = clk::now();
 
@@ -356,10 +356,18 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
 
         // (5) Q31 -> float (원본 full-rate)
         //auto c20 = clk::now();
+        
+        constexpr float kQ31 = 1.0f / 2147483648.0f; // 2^31
         for (int k = 0; k < ddc_samples; ++k) {
-            iq_data_f[2*k]     = static_cast<float>(_pOutIQComplex[2*k]);
-            iq_data_f[2*k + 1] = static_cast<float>(_pOutIQComplex[2*k + 1]);
+            iq_data_f[2*k]     = _pOutIQComplex[2*k]     * kQ31;
+            iq_data_f[2*k + 1] = _pOutIQComplex[2*k + 1] * kQ31;
         }
+        
+        // for (int k = 0; k < ddc_samples; ++k) {
+        //     iq_data_f[2*k]     = static_cast<float>(_pOutIQComplex[2*k]);
+        //     iq_data_f[2*k + 1] = static_cast<float>(_pOutIQComplex[2*k + 1]);
+        // }
+        
         //auto c21 = clk::now();
 
         // ----- [FIX] decirate==64일 때 2:1 평균 디케imation을 “지속 버퍼”에 생성 -----

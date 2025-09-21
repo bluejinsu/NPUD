@@ -798,13 +798,13 @@ void NpuPlayAudioJob::work() {
         return;
     }
 
-    // [NOTE] 프리필 주석과 달리 현재 50% 대기 (필요시 조정)
+    // [NOTE] 프리필 주석과 달리 현재 10% 대기 (필요시 조정)
     {
-        const size_t cap = ddc_exe.ringCapacity();
-        if (cap > 0) {
-            const size_t want = (cap + 4) * 0.5;
-            ddc_exe.waitUntilReadable(want, std::chrono::seconds(2));
-        }
+        // const size_t cap = ddc_exe.ringCapacity();
+        // if (cap > 0) {
+        //     const size_t want = (cap + 4)  * 0.1;
+        //     ddc_exe.waitUntilReadable(want, std::chrono::seconds(2));
+        // }
     }
 
     int samplerate = ddc_exe.getChannelSamplerate();
@@ -847,7 +847,8 @@ void NpuPlayAudioJob::work() {
     }
 
     // 정리: DDCExecutor 종료 (리더 스레드 포함)
-    ddc_exe.stop();
+    //ddc_exe.stop();
+    ddc_exe.close();
 }
 
 std::string NpuPlayAudioJob::start(JOB_COMPLEDTED_CALLBACK completed_callback) {
