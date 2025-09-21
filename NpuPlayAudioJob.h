@@ -1,0 +1,75 @@
+#ifndef NPU_PLAY_AUDIO_H		// 250919 03:36
+#define NPU_PLAY_AUDIO_H
+
+#include "NpuPlayAudioRequest.h"
+
+#include <boost/make_unique.hpp>
+#include <boost/thread.hpp>
+
+#include <boost/make_unique.hpp>
+#include <boost/thread.hpp>
+
+#include <functional>
+#include <memory>
+#include <string>
+#include <thread>
+
+class TaskScheduler;
+class ServerMediaSession;
+class DataStorageInfo;
+class ExtractDemodulator;
+class IPCMSource;
+class NpuConfigure;
+class RTSPServer;
+class TaskScheduler;
+class UsageEnvironment;
+
+
+
+class NpuPlayAudioJob : public std::enable_shared_from_this<NpuPlayAudioJob> {
+public:
+	typedef std::function<void(const std::string&)> JOB_COMPLEDTED_CALLBACK;
+
+private:
+    // NpuPlayAudioJob.h (private:)
+    TaskScheduler* _scheduler = nullptr;          // [ADD] live555 scheduler
+    ServerMediaSession* _sms = nullptr;           // [ADD] live555 session object (close 필요)
+    
+    NpuPlayAudioRequest _play_audio_req;
+    NpuConfigure* _config;
+    std::unique_ptr<DataStorageInfo> _data_storage_info;
+
+    boost::mutex _mtx;
+    std::string _guid;
+    std::unique_ptr<std::thread> _thread;
+    bool _running;
+    bool _stopLoop;
+
+    RTSPServer* _rtspServer;
+    //TaskScheduler* _scheduler;
+    UsageEnvironment* _env;
+    std::thread _serverThread;
+
+    std::string _rtsp_ip;
+    int _rtsp_port;
+
+    JOB_COMPLEDTED_CALLBACK _completed_callback;
+
+private:
+    void startRtspServer(IPCMSource* ext_demod);
+    void work();
+
+public:
+    NpuPlayAudioJob(const NpuPlayAudioRequest& play_audio_req, NpuConfigure* config, int rtsp_port, std::unique_ptr<DataStorageInfo> data_storage_info);
+    ~NpuPlayAudioJob();
+
+    std::string start(JOB_COMPLEDTED_CALLBACK completed_callback);
+	void stop();
+	void wait();
+
+    std::string getGuid() { return _guid; }
+    std::string getRtspIp() { return _rtsp_ip; }
+    int getRtspPort() { return _rtsp_port; }
+};
+
+#endif

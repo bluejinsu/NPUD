@@ -1,0 +1,7 @@
+/home/administrator/src/npud/CMakeFiles/install/strip.dir
+/home/administrator/src/npud/CMakeFiles/edit_cache.dir
+/home/administrator/src/npud/CMakeFiles/npud.dir
+/home/administrator/src/npud/CMakeFiles/list_install_components.dir
+/home/administrator/src/npud/CMakeFiles/install/local.dir
+/home/administrator/src/npud/CMakeFiles/rebuild_cache.dir
+/home/administrator/src/npud/CMakeFiles/install.dir
