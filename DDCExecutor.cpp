@@ -329,6 +329,7 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
 
         // 64→2, 32→4, 16→8 (그 외는 1=미적용)
         unsigned postDecim = 1u;
+        
         if (_decirate == 64u || _decirate == 32u || _decirate == 16u) {
             postDecim = 128u / static_cast<unsigned>(_decirate); // 64→2, 32→4, 16→8
         }
@@ -336,21 +337,7 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
         eff_fs /= postDecim;
 
         unsigned out_samples = static_cast<unsigned>(ddc_samples);
-        float*   out_ptr     = iq_data_f.data();
-
-        // if (_decirate == 64) {
-        //     const unsigned inN = static_cast<unsigned>(ddc_samples);
-        //     const unsigned N2  = inN / 2;
-        //     iq_data_f_half.resize(static_cast<size_t>(N2) * 2);
-        //     for (unsigned k = 0; k < N2; ++k) {
-        //         const unsigned i0 = 2u * (2u * k);
-        //         const unsigned i1 = i0 + 2u;
-        //         iq_data_f_half[2*k]     = 0.5f * (iq_data_f[i0]     + iq_data_f[i1]);
-        //         iq_data_f_half[2*k + 1] = 0.5f * (iq_data_f[i0 + 1] + iq_data_f[i1 + 1]);
-        //     }
-        //     out_samples = N2;
-        //     out_ptr     = iq_data_f_half.data();
-        // }
+        float*   out_ptr     = iq_data_f.data();        
 
         // postDecim > 1인 경우 평균 다운샘플 수행
         static std::vector<float> post_buf; // persistent secondary buffer (I,Q interleaved)
@@ -380,15 +367,7 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
 
             out_samples = outN;
             out_ptr     = post_buf.data();
-        }
-
-        // 핸들러 호출
-        // const int64_t ts_ms = static_cast<int64_t>(_starttime) * 1000
-        //                     + static_cast<int64_t>((_read_samples / eff_fs) * 1000.0);        
-
-        // ddc_handler->onFullBuffer(static_cast<time_t>(ts_ms), out_ptr, out_samples);
-        // _read_samples += out_samples;
-        // processed_any = true;
+        }        
 
          // 핸들러 호출 (타임스탬프는 최종 eff_fs 기준)
         const int64_t ts_ms = static_cast<int64_t>(_starttime) * 1000

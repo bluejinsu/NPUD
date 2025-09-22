@@ -107,30 +107,6 @@ static void _ShutdownOnLoopTask(void* clientData) {
 
     LOGI("[RTSP] shutdownOnLoop(): begin");
 
-    // if (self->_rtspServer && g_sms) {
-    //     // LOGI("[RTSP] closeAllClientSessionsForServerMediaSession()");
-    //     // self->_rtspServer->closeAllClientSessionsForServerMediaSession(g_sms);
-
-    //     // LOGI("[RTSP] removeServerMediaSession()");
-    //     // self->_rtspServer->removeServerMediaSession(g_sms);
-
-    //     // ❌ 지우세요: g_sms->deleteAllSubsessions();
-
-    //     LOGI("[RTSP] Medium::close(g_sms)");
-    //     ServerMediaSession* sms = g_sms;
-    //     g_sms->close();
-    //     g_sms = nullptr;
-    //     Medium::close(sms);
-    //     g_sessionClosed = true;
-    // } else if (g_sms) {
-    //     // 서버가 이미 nullptr이어도 소유권은 우리에게 있음
-    //     LOGI("[RTSP] Medium::close(g_sms) (server is null)");
-    //     ServerMediaSession* sms = g_sms;
-    //     g_sms = nullptr;
-    //     Medium::close(sms);
-    //     g_sessionClosed = true;
-    // }
-
     if (self->_rtspServer) {
         LOGI("[RTSP] Medium::close(_rtspServer)");
         Medium::close(self->_rtspServer);
@@ -557,25 +533,29 @@ private:
 
     double getPowerLevel(float* ddc_iq, size_t ddc_samples) {
         FFTExecutor fft_executor;
-        fft_executor.init((int)ddc_samples);
-        std::vector<double> iq_data_d(ddc_samples * 2);
-        std::vector<double> fft_output(ddc_samples * 2);
-        for (int k = 0; k < (int)ddc_samples; ++k) {
+        const int N = static_cast<int>(ddc_samples);              // [CHANGE] 실제 길이
+        fft_executor.init(N);
+
+        std::vector<double> iq_data_d(static_cast<size_t>(N) * 2);
+        std::vector<double> fft_output(static_cast<size_t>(N) * 2);
+        for (int k = 0; k < N; ++k) {
             iq_data_d[2*k]     = (double)ddc_iq[2*k];
             iq_data_d[2*k + 1] = (double)ddc_iq[2*k + 1];
         }
-        fft_executor.execute(iq_data_d.data(), fft_output.data());
+
+        // [CHANGE] execute(..., N) : 길이 가변 FFT 안전 실행
+        fft_executor.execute(iq_data_d.data(), fft_output.data(), N);
 
         double max_power_level = -999.0;
-        double fft_level_offset = 20 * log10((double)ddc_samples);
+        double fft_level_offset = 20 * log10((double)N);
 
-        for (int i = (int)ddc_samples/2; i < (int)ddc_samples; ++i) {
+        for (int i = N/2; i < N; ++i) {
             double real = fft_output[2*i];     if (real == 0) real += 1e-7;
             double imag = fft_output[2*i + 1]; if (imag == 0) imag += 1e-7;
             double power = 10 * log10(real*real + imag*imag) + _level_offset - fft_level_offset;
             if (max_power_level < power) max_power_level = power;
         }
-        for (int i = 0; i < (int)ddc_samples/2; ++i) {
+        for (int i = 0; i < N/2; ++i) {
             double real = fft_output[2*i];     if (real == 0) real += 1e-7;
             double imag = fft_output[2*i + 1]; if (imag == 0) imag += 1e-7;
             double power = 10 * log10(real*real + imag*imag) + _level_offset - fft_level_offset;
@@ -954,82 +934,6 @@ std::string NpuPlayAudioJob::start(JOB_COMPLEDTED_CALLBACK completed_callback) {
     return _guid;
 }
 
-// void NpuPlayAudioJob::stop() {
-//     LOGI("[Job] stop() requested");
-//     {
-//         boost::lock_guard<boost::mutex> lock(_mtx);
-//         if (!_running) LOGW("[Job] stop(): already stopped");
-//         _running = false;
-//     }
-
-//     // ========== 1) 루프 스레드에 “종료 작업” 예약 (세션/서버 정리 + watch-var set) ==========
-//     if (_env) {
-//         LOGI("[RTSP] scheduleDelayedTask(0, _ShutdownOnLoopTask)");
-//         _env->taskScheduler().scheduleDelayedTask(0, (TaskFunc*)_ShutdownOnLoopTask, this);
-//     }
-
-//     // 루프 스레드를 즉시 깨워 ShutdownOnLoopTask가 실행되도록 유도
-//     if (_env && _stopTrigger != 0) {
-//         LOGI("[RTSP] triggerEvent(id=%u) for StopLoopTask", (unsigned)_stopTrigger);
-//         _env->taskScheduler().triggerEvent(_stopTrigger, this);
-//     }
-
-//     // ========== 2) 서버 스레드 조인 (doEventLoop 탈출 대기) ==========
-//     if (_serverThread.joinable()) {
-//         if (std::this_thread::get_id() == _serverThread.get_id()) {
-//             LOGE("[RTSP] stop() called from server thread; skip join to avoid self-join deadlock");
-//         } else {
-//             LOGI("[RTSP] joining server thread...");
-//             _serverThread.join();
-//             g_serverThreadJoined = true;
-//             LOGI("[RTSP] server thread joined (rtspLoopStopped=%s)", g_rtspLoopStopped ? "true":"false");
-//         }
-//     } else {
-//         LOGW("[RTSP] server thread not joinable");
-//     }
-
-//     // ========== 3) 트리거 정리 ==========
-//     if (_env && _stopTrigger != 0) {
-//         LOGI("[RTSP] deleteEventTrigger(id=%u)", (unsigned)_stopTrigger);
-//         _env->taskScheduler().deleteEventTrigger(_stopTrigger);
-//         _stopTrigger = 0;
-//     }
-
-//     // ========== 4) env/scheduler 정리 (항상 마지막) ==========
-//     if (_env) {
-//         LOGI("[RTSP] reclaim _env");
-//         _env->reclaim();
-//         _env = nullptr;
-//         g_envReclaimed = true;
-//     }
-//     if (_scheduler) {
-//         LOGI("[RTSP] delete _scheduler");
-//         delete _scheduler;
-//         _scheduler = nullptr;
-//         g_schedulerDeleted = true;
-//     }
-
-//     // ========== 5) 작업 스레드 종료(마지막) ==========
-//     wait();
-//     g_workerJoined = true;
-
-//     // 콜백 통지 (있다면)
-//     if (_completed_callback) {
-//         LOGI("[Job] invoking completed_callback(guid=%s)", _guid.c_str());
-//         try { _completed_callback(_guid); } catch (...) { LOGE("[Job] completed_callback threw"); }
-//     }
-
-//     LOGI("[Job] shutdown summary:"
-//          " rtspLoopStopped=%s, serverThreadJoined=%s, sessionClosed=%s, rtspClosed=%s, envReclaimed=%s, schedulerDeleted=%s, workerJoined=%s",
-//          g_rtspLoopStopped ? "true":"false",
-//          g_serverThreadJoined ? "true":"false",
-//          g_sessionClosed ? "true":"false",
-//          g_rtspClosed ? "true":"false",
-//          g_envReclaimed ? "true":"false",
-//          g_schedulerDeleted ? "true":"false",
-//          g_workerJoined ? "true":"false");
-// }
-
 void NpuPlayAudioJob::stop() {
     LOGI("[Job] stop() requested");
     {
@@ -1037,17 +941,6 @@ void NpuPlayAudioJob::stop() {
         if (!_running) LOGW("[Job] stop(): already stopped");
         _running = false;
     }
-
-    // // 1) 루프 스레드에서 종료 로직 실행: cross-thread safe 경로(트리거)로만 깨운다
-    // if (_env && g_shutdownTrigger != 0) {
-    //     LOGI("[RTSP] triggerEvent(g_shutdownTrigger)");
-    //     _env->taskScheduler().triggerEvent(g_shutdownTrigger, this);
-    // }
-    // // watch-var 갱신 트리거도 함께
-    // if (_env && _stopTrigger != 0) {
-    //     LOGI("[RTSP] triggerEvent(_stopTrigger)");
-    //     _env->taskScheduler().triggerEvent(_stopTrigger, this);
-    // }
 
     // after: _stopTrigger는 건드리지 않습니다. g_shutdownTrigger만!
     if (_env && g_shutdownTrigger != 0) {

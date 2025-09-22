@@ -46,9 +46,18 @@ void NpuWatchProcess::init(const NpuWatchRequest& watch_req, const NpuWatchInfo&
         file_writer.reset(new NpuExtractWavWriter(&_filename_formatter));
     }
 
+    // [CHANGE] 사용자가 선택한 라이터를 실제로 적용 (기존: 강제로 16t 생성)
+    // _file_writer는 원래 raw pointer로 보이므로 release 사용
+    if (file_writer) {
+        _file_writer = file_writer.release();
+    } else {
+        // fallback: 기본 16t
+        _file_writer = new NpuExtract16tWriter(&_filename_formatter);
+    }
 
-    _file_writer = new NpuExtract16tWriter(&_filename_formatter);
-    _fft_executor.init(ddc_samples);
+    // [CHANGE] FFT 초기 길이는 최초 ddc_samples로 준비하되,
+    //           실제 실행 시 들어오는 길이에 맞춰 자동 재생성(아래 execute에서 length 전달)
+    _fft_executor.init(static_cast<int>(ddc_samples));
 
     _watchFileSaveInfo._output_path = boost::filesystem::path(_config_data.output_path + _watch_info.guid);
     boost::filesystem::path spec_dir(_watchFileSaveInfo._output_path.string() + "/" + "spec");
@@ -66,47 +75,55 @@ double NpuWatchProcess::getPowerLevel(const float* ddc_iq, size_t ddc_samples) {
     std::vector<double> iq_data_d;
     std::vector<double> fft_output;
 
-    iq_data_d.resize(ddc_samples * 2);
-    fft_output.resize(ddc_samples * 2);
+    // ddc_samples: "복소 샘플 개수"
+    const int N = static_cast<int>(ddc_samples);
 
-    for (int k = 0; k < ddc_samples; k++) {
-        iq_data_d[2 * k] = (double)ddc_iq[2 * k];
-        iq_data_d[2 * k + 1] = (double)ddc_iq[2 * k + 1];
+    iq_data_d.resize(static_cast<size_t>(N) * 2);
+    fft_output.resize(static_cast<size_t>(N) * 2);
+
+    for (int k = 0; k < N; k++) {
+        iq_data_d[2 * k]     = static_cast<double>(ddc_iq[2 * k]);
+        iq_data_d[2 * k + 1] = static_cast<double>(ddc_iq[2 * k + 1]);
     }
-    _fft_executor.execute(iq_data_d.data(), fft_output.data());
 
-    if (_avg_spec.size() == 0)
-        _avg_spec.resize(ddc_samples);
+    // [CHANGE] 실제 길이 N으로 FFT 실행 (내부에서 길이가 다르면 plan 재생성)
+    _fft_executor.execute(iq_data_d.data(), fft_output.data(), N);
 
-    double fft_level_offset = 20 * log10(ddc_samples);
-    for (int i = ddc_samples / 2; i < ddc_samples; i++) {
+    // [CHANGE] 평균 스펙트럼 버퍼 길이 보장 (길이가 달라지면 재할당/초기화)
+    if (_avg_spec.size() != static_cast<size_t>(N)) {
+        _avg_spec.assign(static_cast<size_t>(N), 0.0);
+        _avg_count = 0;
+    }
+
+    double fft_level_offset = 20.0 * log10(static_cast<double>(N));
+    for (int i = N / 2; i < N; i++) {
         double real = fft_output[2 * i];
         double imag = fft_output[2 * i + 1];
 
-        if (real == 0) real += 0.0000001;
-        if (imag == 0) imag += 0.0000001;
+        if (real == 0) real += 1e-7;
+        if (imag == 0) imag += 1e-7;
 
-        double power = 10 * log10(real * real + imag * imag) + _config_data.level_offset - fft_level_offset;
+        double power = 10.0 * log10(real * real + imag * imag) + _config_data.level_offset - fft_level_offset;
 
         if (max_power_level < power)
             max_power_level = power;
 
-        _avg_spec[i - (ddc_samples / 2)] += power / 64;
+        _avg_spec[static_cast<size_t>(i - (N / 2))] += power / 64.0;
     }
 
-    for (int i = 0; i < ddc_samples / 2; i++) {
+    for (int i = 0; i < N / 2; i++) {
         double real = fft_output[2 * i];
         double imag = fft_output[2 * i + 1];
 
-        if (real == 0) real += 0.0000001;
-        if (imag == 0) imag += 0.0000001;
+        if (real == 0) real += 1e-7;
+        if (imag == 0) imag += 1e-7;
 
-        double power = 10 * log10(real * real + imag * imag) + _config_data.level_offset - fft_level_offset;
+        double power = 10.0 * log10(real * real + imag * imag) + _config_data.level_offset - fft_level_offset;
 
         if (max_power_level < power)
             max_power_level = power;
 
-        _avg_spec[i + ddc_samples / 2] += power / 64;
+        _avg_spec[static_cast<size_t>(i + (N / 2))] += power / 64.0;
     }
 
     return max_power_level;
@@ -305,7 +322,7 @@ void NpuWatchProcess::onIQDataReceived(time_t timestamp, int64_t frequency, int 
 
             initFileSaveInfo(timestamp, frequency, bandwidth, samplerate);
             initFile();
-            writeToFile(ddc_iq, ddc_samples);
+            writeToFile(ddc_iq, static_cast<int>(ddc_samples));
             updateFileSaveInfo(timestamp, frequency, bandwidth, samplerate);
         }
     } else if (_state == EnWatchState::ALIVE) {
@@ -325,7 +342,7 @@ void NpuWatchProcess::onIQDataReceived(time_t timestamp, int64_t frequency, int 
             initFile();
         }
 
-        writeToFile(ddc_iq, ddc_samples);
+        writeToFile(ddc_iq, static_cast<int>(ddc_samples));
         updateFileSaveInfo(timestamp, frequency, bandwidth, samplerate);
         if (power_level > _max_channel_power) {
             _max_channel_power = power_level;
@@ -339,7 +356,7 @@ void NpuWatchProcess::onIQDataReceived(time_t timestamp, int64_t frequency, int 
             _state = EnWatchState::ALIVE;
             _holdtime = 0.0;
 
-            writeToFile(ddc_iq, ddc_samples);
+            writeToFile(ddc_iq, static_cast<int>(ddc_samples));
             updateFileSaveInfo(timestamp, frequency, bandwidth, samplerate);
 
         } else {
@@ -351,7 +368,7 @@ void NpuWatchProcess::onIQDataReceived(time_t timestamp, int64_t frequency, int 
                 saveDatabase();
                 closeFile();
             } else {
-                writeToFile(ddc_iq, ddc_samples);
+                writeToFile(ddc_iq, static_cast<int>(ddc_samples));
                 updateFileSaveInfo(timestamp, frequency, bandwidth, samplerate);
             }
         }
@@ -369,14 +386,15 @@ void NpuWatchProcess::onIQDataReceived(time_t timestamp, int64_t frequency, int 
         if (!spec_file.good())
             return;
 
-        for (int i = 0; i < ddc_samples; i++) {
-            spec_file << _avg_spec[i] << "\n";
+        for (int i = 0; i < static_cast<int>(ddc_samples); i++) {
+            spec_file << _avg_spec[static_cast<size_t>(i)] << "\n";
         }
 
         spec_file.close();
 
         _avg_count = 0;
-        memset(&_avg_spec[0], 0, ddc_samples * sizeof(double));
+        // [CHANGE] 안전 리셋: memset 대신 assign 사용
+        _avg_spec.assign(_avg_spec.size(), 0.0);
     } else {
         _avg_count++;
     }

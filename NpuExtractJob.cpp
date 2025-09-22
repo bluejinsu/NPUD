@@ -87,23 +87,30 @@ void NpuExtractJob::onFullBuffer(time_t timestamp, float* ddc_iq, size_t ddc_sam
     std::vector<double> fft_output;
     std::vector<double> amp_output;
 
-    iq_data_d.resize(ddc_samples * 2);
-    fft_output.resize(ddc_samples * 2);
+    // ===== [CHANGE] 실제 복소 샘플 개수 N으로 안전 처리 =====
+    const int N = static_cast<int>(ddc_samples);
+    iq_data_d.resize(static_cast<size_t>(N) * 2);
+    fft_output.resize(static_cast<size_t>(N) * 2);
 
-    for (int k = 0; k < ddc_samples; k++) {
-        iq_data_d[2 * k] = (double)ddc_iq[2 * k];
+    for (int k = 0; k < N; k++) {
+        iq_data_d[2 * k]     = (double)ddc_iq[2 * k];
         iq_data_d[2 * k + 1] = (double)ddc_iq[2 * k + 1];
     }
-    _fft_executor.execute(iq_data_d.data(), fft_output.data());
 
-    for (int i = 0; i < ddc_samples; i++) {
+    // ===== [CHANGE] FFT 길이를 N으로 맞춰 실행 (내부에서 plan 재생성 보장) =====
+    _fft_executor.execute(iq_data_d.data(), fft_output.data(), N);
+    // ===============================================================
+
+    for (int i = 0; i < N; i++) {
         double real = fft_output[2 * i];
         double imag = fft_output[2 * i + 1];
 
-        if (real == 0) real += 0.0000001;
-        if (imag == 0) imag += 0.0000001;
+        // ===== [CHANGE] 로그 안전장치 (0 보호) =====
+        if (real == 0) real += 1e-7;
+        if (imag == 0) imag += 1e-7;
 
-        double power = 10 * log10(real * real + imag * imag) + _config_data.level_offset - 20 * log10(ddc_samples);
+        double power = 10 * log10(real * real + imag * imag) + _config_data.level_offset - 20 * log10((double)N);
+        // ===========================================
 
         if (_max_channel_power < power)
             _max_channel_power = power;
@@ -120,8 +127,6 @@ void NpuExtractJob::onFullBuffer(time_t timestamp, float* ddc_iq, size_t ddc_sam
     _file_writer->write(ddc_iq, ddc_samples);
 
     // -------------------- [ADD] 진행률 계산: timestamp(ms) 기반 --------------------
-    // DDCExecutor 쪽에서: timestamp = start_ms + 경과(ms) 형태로 전달됨.
-    // 여기서는 (timestamp - start_ms) / (end_ms - start_ms) 로 퍼센트 계산.
     const long long start_ms = static_cast<long long>(_ext_info.starttime) * 1000LL;
     const long long end_ms   = static_cast<long long>(_ext_info.endtime)   * 1000LL;
     const long long total_ms = std::max(1LL, end_ms - start_ms); // 0 나눗셈 방지
@@ -168,16 +173,6 @@ std::unique_ptr<NpuExtractResult> NpuExtractJob::extractIQ(const DataStorageInfo
 
     _fft_executor.init(ddc_samples);
     _max_channel_power = -9999.9;
-
-    // // ====== [PATCH] RTSP 패턴과 동일한 실행 루프로 교체 ======
-    // while (_ddc_exe.getRunning()) {
-    //     bool didWork = _ddc_exe.executeDDC(this);
-    //     if (!didWork) {
-    //         // I/O 완료 && 링 버퍼 비었으면 종료
-    //         if (_ddc_exe.ioDone() && _ddc_exe.ringReadable() == 0) break;
-    //         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    //     }
-    // }
 
     // ====== [PATCH] 실행 루프 (ioDone+ringEmpty 재확인 N회) ======
     {
