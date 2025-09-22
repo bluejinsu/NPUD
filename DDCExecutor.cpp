@@ -1,3 +1,5 @@
+// DDCExecutor.cpp  (PATCH-2.1: add robust logging for lifecycle/shutdown) 250922 01:25 KST
+
 #include "DDCExecutor.h"  // 250919 03:36
 
 #include <cstring>
@@ -8,18 +10,38 @@
 #include <vector>
 #include <thread>
 #include <chrono>
-#include <cstdio>   // ← 추가
-
-// [PATCH] 추가: SPSC 링버퍼로 I/O 스레드와 DSP 스레드 분리
+#include <cstdio>   // for fprintf
 #include "SpscRing.h"
 #include <atomic>
 #include <mutex>
 #include <condition_variable>
 
+#include <ctime>    // UTC 포맷용
+#include <string>   // std::string
 
-#include <ctime>    // [ADD] UTC 포맷용
-#include <string>   // [ADD] std::string
+// ========== [ADD] 초간단 로그 유틸 ==========
+#include <iomanip>
+#include <sstream>
 
+static inline std::string _NowTs_DDC() {
+    using namespace std::chrono;
+    auto t  = system_clock::now();
+    auto tt = system_clock::to_time_t(t);
+    auto ms = duration_cast<milliseconds>(t.time_since_epoch()) % 1000;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%F %T") << "." << std::setw(3) << std::setfill('0') << ms.count();
+    return oss.str();
+}
+
+#define LOGI(fmt, ...) do { std::fprintf(stderr, "[%s][I][DDC][tid=%zu] " fmt "\n", _NowTs_DDC().c_str(), (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), ##__VA_ARGS__ ); } while(0)
+#define LOGW(fmt, ...) do { std::fprintf(stderr, "[%s][W][DDC][tid=%zu] " fmt "\n", _NowTs_DDC().c_str(), (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), ##__VA_ARGS__ ); } while(0)
+#define LOGE(fmt, ...) do { std::fprintf(stderr, "[%s][E][DDC][tid=%zu] " fmt "\n", _NowTs_DDC().c_str(), (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), ##__VA_ARGS__ ); } while(0)
 
 // ====== [ADD-STEP1/2] Feature toggles ======
 #define FEAT_POSIX_IO        0   // 1단계: fstream → POSIX open/read + fadvise
@@ -80,28 +102,7 @@
   #endif
 #endif // FEAT_POSIX_IO
 
-// struct DdcStageStats {
-//     uint64_t n = 0;
-//     double waitRing_us=0, readRing_us=0, s16toQ31_us=0, cuda_us=0, q31toF_us=0, handler_us=0, loop_us=0;
-//     void accum(double wr,double rr,double c1,double cu,double c2,double hh,double lp){
-//         n++; waitRing_us+=wr; readRing_us+=rr; s16toQ31_us+=c1; cuda_us+=cu; q31toF_us+=c2; handler_us+=hh; loop_us+=lp;
-//     }
-// } _ddcStats;
-
-// // [ADD][LOG] UTC 포맷터 (스레드 세이프)
-// static inline std::string toUtcString(time_t t) {
-//     char buf[32];
-// #ifdef _WIN32
-//     struct tm tm_utc;
-//     gmtime_s(&tm_utc, &t);
-//     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_utc);
-// #else
-//     struct tm tm_utc;
-//     gmtime_r(&t, &tm_utc);
-//     strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_utc);
-// #endif
-//     return std::string(buf);
-// }
+// --------------------------------------------------------------------------------------------
 
 DDCExecutor::DDCExecutor() 
     : _work(ios)
@@ -109,9 +110,11 @@ DDCExecutor::DDCExecutor()
     , _pOutIQComplex(nullptr)
     , _pOutSecondaryIQComplex(nullptr)
 {
+    LOGI("ctor");
 }
 
 DDCExecutor::~DDCExecutor() {
+    LOGI("dtor: stop+join and free pinned buffers");
     // [PATCH] 안전한 종료
     stop();
     if (_readerThread.joinable()) _readerThread.join();
@@ -130,9 +133,11 @@ DDCExecutor::~DDCExecutor() {
         cudaFreeHost(_pOutSecondaryIQComplex);
         _pOutSecondaryIQComplex = nullptr;
     }
+    LOGI("dtor done");
 }
 
-std::shared_ptr<cuDDCIQComplex<int>> DDCExecutor::createDDCIQComplex(int source_samplerate, int bandwidth, int samples, float freq_offset, int& decirate, int &channel_bandwidth) {
+std::shared_ptr<cuDDCIQComplex<int>> DDCExecutor::createDDCIQComplex(
+        int source_samplerate, int bandwidth, int samples, float freq_offset, int& decirate, int &channel_bandwidth) {
 
     int samplerate = source_samplerate;
     decirate = 1;
@@ -157,7 +162,7 @@ std::shared_ptr<cuDDCIQComplex<int>> DDCExecutor::createDDCIQComplex(int source_
     ddc_builder.setSampleSize(samples);
 
     bool first = true;
-    for (auto it = fir_filters.begin(); it != fir_filters.end(); it++) {
+    for (auto it = fir_filters.begin(); it != fir_filters.end(); ++it) {
         if (first) {
             ddc_builder.stageWithShift(it->first, freq_offset, it->second);
             first = false;
@@ -231,29 +236,6 @@ bool DDCExecutor::initDDC(const time_t starttime, const time_t endtime, const in
 
     _running = true;
 
-    // // === [ADD][LOG] 요청 시간/주파수 정보 출력 (UTC) ===
-    // {
-    //     const std::string startUtc = toUtcString(_starttime);
-    //     const std::string endUtc   = toUtcString(_endtime);
-
-    //     // 중심 주파수(_frequency), 대역폭(_bandwidth) 기준으로 시작/끝 산출
-    //     const double fc_hz = static_cast<double>(_frequency);
-    //     const double bw_hz = static_cast<double>(_bandwidth);
-    //     const double f0_hz = fc_hz - (bw_hz * 0.5);
-    //     const double f1_hz = fc_hz + (bw_hz * 0.5);
-
-    //     const double f0_mhz = f0_hz / 1e6;
-    //     const double f1_mhz = f1_hz / 1e6;
-    //     const double bw_khz = bw_hz / 1e3;
-
-    //     std::fprintf(stderr,
-    //         "[DDC:init] UTC %ld (%s) → %ld (%s) | FREQ %.3f–%.3f MHz (BW %.3f kHz) | srcFs=%d, wDDC=%.3f MHz, decirate=%d\n",
-    //         static_cast<long>(_starttime), startUtc.c_str(),
-    //         static_cast<long>(_endtime),   endUtc.c_str(),
-    //         f0_mhz, f1_mhz, bw_khz,
-    //         _fs, static_cast<double>(source_freq)/1e6, _decirate);
-    // }
-
     // [PATCH] I/O 링버퍼 초기화 & 리더 스레드 시작
     {
         const size_t ring_cap = std::max<size_t>(static_cast<size_t>(ddc_sample_size) * 8, 2 * 1024 * 1024);
@@ -267,6 +249,7 @@ bool DDCExecutor::initDDC(const time_t starttime, const time_t endtime, const in
 
         _readerThread = std::thread([this]() { this->readerLoopWithPreopen(); });
     }
+    LOGI("initDDC done: decirate=%d, chFs=%u, ringCap=%zu", _decirate, _channel_samplerate, _ring_capacity);
     return true;
 }
 
@@ -281,9 +264,7 @@ bool DDCExecutor::initSecondaryDDC(const time_t starttime, const time_t endtime,
     return true;
 }
 
-
 bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
-    //using clk = std::chrono::steady_clock;
     bool processed_any = false;
 
     const size_t required_bytes = static_cast<size_t>(ddc_sample_size);
@@ -299,136 +280,133 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {
     while (_running) {
         if (!_ring) break;
 
-        //auto t0 = clk::now();
-
-        // (1) wait
-        //auto w0 = clk::now();
         const bool ok = waitUntilReadable(required_bytes, std::chrono::milliseconds(200));
-        //auto w1 = clk::now();
 
-        // ===== [TAIL][AUTO] ioDone 이후 남은 잔량(<required) 자동 처리 =====
-        // - waitUntilReadable() 실패했더라도, ioDone이고 ring에 뭔가 남아 있으면 tail로 간주하고 0-패딩 처리
+        // ioDone 이후 tail 처리
         if (!ok) {
             if (_ring && ioDone()) {
                 const size_t avail = _ring->readable();
                 if (avail > 0 && avail < required_bytes) {
-                    // tail: avail 만큼 읽고 나머지는 0 패딩
                     std::fill(batch.begin(), batch.end(), 0);
                     size_t got_tail = _ring->read(batch.data(), avail);
-                    if (got_tail != avail) {
-                        // 경쟁 조건으로 줄었으면 다음 루프로
-                        continue;
-                    }
-                    // 아래 정규 파이프라인으로 처리
+                    if (got_tail != avail) continue;
                 } else {
-                    // 더 읽을 것도 없으면 종료
                     break;
                 }
             } else {
-                // ioDone 아니면 계속 대기 루프
                 continue;
             }
         } else {
-            // 정규 경로: 충분히 찼음 → required_bytes 읽기
             size_t got = _ring->read(batch.data(), required_bytes);
             if (got < required_bytes) {
-                // 드물게 경쟁 상황: ioDone이면 tail 로직에서 잡힘
                 if (ioDone()) continue;
                 else continue;
             }
         }
 
-        // (3) s16 -> Q31
-        //auto c10 = clk::now();
+        // s16 -> Q31
         const int16_t* src16 = reinterpret_cast<const int16_t*>(batch.data());
         for (size_t k = 0; k < required_shorts; ++k) {
             input_iq[k] = static_cast<int32_t>(src16[k]) << 15;
         }
-        //auto c11 = clk::now();
 
-        // (4) CUDA DDC
-        //auto cu0 = clk::now();
+        // CUDA DDC
         master->input(input_iq.data());
         master->asyncDecimate();
         master->output(_pOutIQComplex);
         master->wait();
-        //auto cu1 = clk::now();
 
-        // (5) Q31 -> float (원본 full-rate)
-        //auto c20 = clk::now();
-        
+        // Q31 -> float
         constexpr float kQ31 = 1.0f / 2147483648.0f; // 2^31
         for (int k = 0; k < ddc_samples; ++k) {
             iq_data_f[2*k]     = _pOutIQComplex[2*k]     * kQ31;
             iq_data_f[2*k + 1] = _pOutIQComplex[2*k + 1] * kQ31;
         }
-        
-        // for (int k = 0; k < ddc_samples; ++k) {
-        //     iq_data_f[2*k]     = static_cast<float>(_pOutIQComplex[2*k]);
-        //     iq_data_f[2*k + 1] = static_cast<float>(_pOutIQComplex[2*k + 1]);
-        // }
-        
-        //auto c21 = clk::now();
 
-        // ----- [FIX] decirate==64일 때 2:1 평균 디케imation을 “지속 버퍼”에 생성 -----
-        // const double eff_fs = static_cast<double>(_fs) / static_cast<double>(_decirate);
+        // decirate==64 보정 (2:1)
         double eff_fs = static_cast<double>(_fs) / static_cast<double>(_decirate);
-        
-        //unsigned postDecim = 2u;
-        unsigned postDecim = (_decirate == 64) ? 2u : 1u;
+        // unsigned postDecim = (_decirate == 64) ? 2u : 1u;
+
+        // 64→2, 32→4, 16→8 (그 외는 1=미적용)
+        unsigned postDecim = 1u;
+        if (_decirate == 64u || _decirate == 32u || _decirate == 16u) {
+            postDecim = 128u / static_cast<unsigned>(_decirate); // 64→2, 32→4, 16→8
+        }
+
         eff_fs /= postDecim;
 
         unsigned out_samples = static_cast<unsigned>(ddc_samples);
         float*   out_ptr     = iq_data_f.data();
-        //if(true) {
-        if (_decirate == 64) {
-            const unsigned inN = static_cast<unsigned>(ddc_samples);
-            const unsigned N2  = inN / 2;
-            // 홀수 안전: 마지막 1개가 남으면 그냥 버림
-            iq_data_f_half.resize(static_cast<size_t>(N2) * 2);
 
-            // (I0+I1)/2, (Q0+Q1)/2
-            for (unsigned k = 0; k < N2; ++k) {
-                const unsigned i0 = 2u * (2u * k);
-                const unsigned i1 = i0 + 2u;
-                iq_data_f_half[2*k]     = 0.5f * (iq_data_f[i0]     + iq_data_f[i1]);
-                iq_data_f_half[2*k + 1] = 0.5f * (iq_data_f[i0 + 1] + iq_data_f[i1 + 1]);
+        // if (_decirate == 64) {
+        //     const unsigned inN = static_cast<unsigned>(ddc_samples);
+        //     const unsigned N2  = inN / 2;
+        //     iq_data_f_half.resize(static_cast<size_t>(N2) * 2);
+        //     for (unsigned k = 0; k < N2; ++k) {
+        //         const unsigned i0 = 2u * (2u * k);
+        //         const unsigned i1 = i0 + 2u;
+        //         iq_data_f_half[2*k]     = 0.5f * (iq_data_f[i0]     + iq_data_f[i1]);
+        //         iq_data_f_half[2*k + 1] = 0.5f * (iq_data_f[i0 + 1] + iq_data_f[i1 + 1]);
+        //     }
+        //     out_samples = N2;
+        //     out_ptr     = iq_data_f_half.data();
+        // }
+
+        // postDecim > 1인 경우 평균 다운샘플 수행
+        static std::vector<float> post_buf; // persistent secondary buffer (I,Q interleaved)
+        if (postDecim > 1u) {
+            const unsigned inN = static_cast<unsigned>(ddc_samples);
+            const unsigned outN = inN / postDecim;       // 나머지는 버림(정확히 나눠떨어지는게 보통)
+            const float invM = 1.0f / static_cast<float>(postDecim);
+
+            post_buf.resize(static_cast<size_t>(outN) * 2);
+
+            // k번째 출력 복소샘플 = 입력의 [k*postDecim ... k*postDecim+postDecim-1] 평균
+            // I와 Q 각각 평균
+            for (unsigned k = 0; k < outN; ++k) {
+                const unsigned baseIn = k * postDecim;   // 복소샘플 인덱스(샘플 단위)
+                float accI = 0.0f, accQ = 0.0f;
+
+                // postDecim은 2/4/8 중 하나이므로 단순 루프가 충분히 빠름
+                for (unsigned m = 0; m < postDecim; ++m) {
+                    const unsigned i = (baseIn + m) * 2u; // float 인덱스 (I,Q interleaved)
+                    accI += iq_data_f[i];
+                    accQ += iq_data_f[i + 1u];
+                }
+
+                post_buf[2u * k]     = accI * invM;
+                post_buf[2u * k + 1] = accQ * invM;
             }
 
-            out_samples = N2;
-            out_ptr     = iq_data_f_half.data();
+            out_samples = outN;
+            out_ptr     = post_buf.data();
         }
-        // --------------------------------------------------------------------
 
-        // (6) handler
+        // 핸들러 호출
+        // const int64_t ts_ms = static_cast<int64_t>(_starttime) * 1000
+        //                     + static_cast<int64_t>((_read_samples / eff_fs) * 1000.0);        
+
+        // ddc_handler->onFullBuffer(static_cast<time_t>(ts_ms), out_ptr, out_samples);
+        // _read_samples += out_samples;
+        // processed_any = true;
+
+         // 핸들러 호출 (타임스탬프는 최종 eff_fs 기준)
         const int64_t ts_ms = static_cast<int64_t>(_starttime) * 1000
-                    + static_cast<int64_t>((_read_samples / eff_fs) * 1000.0);        
+                            + static_cast<int64_t>((_read_samples / eff_fs) * 1000.0);
 
-        //auto h0 = clk::now();
         ddc_handler->onFullBuffer(static_cast<time_t>(ts_ms), out_ptr, out_samples);
-        //auto h1 = clk::now();
-
-        // [FIX] 실제로 보낸 샘플 수만큼 증가
         _read_samples += out_samples;
-
-        //auto t1 = clk::now();
-
         processed_any = true;
-
-        // tail을 처리한 직후라면, 다음 루프에서 ioDone && ring 비었는지에 따라 빠져나가게 둔다.
-        // (여기서 즉시 break하지 않는 이유: 동일 호출 내에서 추가 데이터가 이미 들어와 있을 수 있음)
     }
     return processed_any;
 }
-
 
 bool DDCExecutor::getRunning() {
     return _running;
 }
 
 bool DDCExecutor::executeDDCDF(IDDCHandler* ddc_handler) {
-    // (네가 준 코드 그대로 — 중략 없이 유지)
-    // ... (원본 executeDDCDF 구현)
+    // (네가 가진 원본 그대로 — 필요 시 구현)
     return false;
 }
 
@@ -451,25 +429,7 @@ void DDCExecutor::parseStreamHeader(stStreamHeader& header, const char* frame_pt
     return;
 }
 
-// ... (matchBchFrameSync / matchAchFrameSync — 네가 준 코드 그대로 유지)
-
-void DDCExecutor::stop() {
-    // [PATCH] 러닝 플래그 off
-    {
-        boost::lock_guard<boost::mutex> lock(_mtx);
-        _running = false;
-    }
-    // readerLoop가 1ms sleep 중이라도 자연 종료됨
-}
-
-void DDCExecutor::close() {
-    // [PATCH] 실제 정리 수행: stop + join
-    stop();
-    if (_readerThread.joinable())
-        _readerThread.join();
-}
-
-// ===================== [PATCH] 아래는 private 구현 =====================
+// =====  파일 열기/전환/읽기 루틴들  =================================================
 
 std::string DDCExecutor::makeFilePath(int index)
 {
@@ -750,9 +710,11 @@ void DDCExecutor::readerLoopWithPreopen()
 
     if (!openCurrentFileIfNeeded()) {
         _ioDone.store(true, std::memory_order_release);
+        LOGE("reader: openCurrentFileIfNeeded() failed");
         return;
     }
     preopenNextFile();
+    LOGI("reader: enter loop");
 
     while (_running && _frames_to_collect > 0) {
         bulkReadFramesIntoRing();
@@ -775,6 +737,7 @@ void DDCExecutor::readerLoopWithPreopen()
     if (_nextFile.is_open()) { _nextFile.close(); }
 #endif
     _ioDone.store(true, std::memory_order_release);
+    LOGI("reader: exit loop (ioDone=true)");
 }
 
 size_t DDCExecutor::ringCapacity() const {
@@ -791,4 +754,22 @@ bool DDCExecutor::waitUntilReadable(size_t wantBytes, std::chrono::milliseconds 
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     return (_ring && _ring->readable() >= wantBytes);
+}
+
+void DDCExecutor::stop() {
+    {
+        boost::lock_guard<boost::mutex> lock(_mtx);
+        if (!_running) return;
+        _running = false;
+    }
+    LOGI("stop(): running=false set");
+}
+
+void DDCExecutor::close() {
+    LOGI("close(): stop()+join reader");
+    stop();
+    if (_readerThread.joinable()) {
+        _readerThread.join();
+        LOGI("reader thread joined");
+    }
 }

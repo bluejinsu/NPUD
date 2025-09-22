@@ -1,10 +1,7 @@
-#ifndef NPU_PLAY_AUDIO_H		// 250919 03:36
+#ifndef NPU_PLAY_AUDIO_H
 #define NPU_PLAY_AUDIO_H
 
 #include "NpuPlayAudioRequest.h"
-
-#include <boost/make_unique.hpp>
-#include <boost/thread.hpp>
 
 #include <boost/make_unique.hpp>
 #include <boost/thread.hpp>
@@ -13,6 +10,7 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <cstdint>   // uint32_t
 
 class TaskScheduler;
 class ServerMediaSession;
@@ -21,20 +19,15 @@ class ExtractDemodulator;
 class IPCMSource;
 class NpuConfigure;
 class RTSPServer;
-class TaskScheduler;
 class UsageEnvironment;
-
-
 
 class NpuPlayAudioJob : public std::enable_shared_from_this<NpuPlayAudioJob> {
 public:
-	typedef std::function<void(const std::string&)> JOB_COMPLEDTED_CALLBACK;
-
+    typedef std::function<void(const std::string&)> JOB_COMPLEDTED_CALLBACK;
+    RTSPServer* _rtspServer = nullptr;
 private:
-    // NpuPlayAudioJob.h (private:)
-    TaskScheduler* _scheduler = nullptr;          // [ADD] live555 scheduler
-    ServerMediaSession* _sms = nullptr;           // [ADD] live555 session object (close 필요)
-    
+    TaskScheduler* _scheduler = nullptr;          // live555 scheduler
+    ServerMediaSession* _sms = nullptr;           // live555 session
     NpuPlayAudioRequest _play_audio_req;
     NpuConfigure* _config;
     std::unique_ptr<DataStorageInfo> _data_storage_info;
@@ -42,18 +35,19 @@ private:
     boost::mutex _mtx;
     std::string _guid;
     std::unique_ptr<std::thread> _thread;
-    bool _running;
-    bool _stopLoop;
+    bool _running = false;
 
-    RTSPServer* _rtspServer;
-    //TaskScheduler* _scheduler;
-    UsageEnvironment* _env;
+    
+    UsageEnvironment* _env = nullptr;
     std::thread _serverThread;
 
     std::string _rtsp_ip;
-    int _rtsp_port;
+    int _rtsp_port = 0;
 
     JOB_COMPLEDTED_CALLBACK _completed_callback;
+
+    // Event trigger id (live555 TaskScheduler::EventTriggerId와 동일한 너비)
+    uint32_t _stopTrigger {0};
 
 private:
     void startRtspServer(IPCMSource* ext_demod);
@@ -64,8 +58,8 @@ public:
     ~NpuPlayAudioJob();
 
     std::string start(JOB_COMPLEDTED_CALLBACK completed_callback);
-	void stop();
-	void wait();
+    void stop();
+    void wait();
 
     std::string getGuid() { return _guid; }
     std::string getRtspIp() { return _rtsp_ip; }

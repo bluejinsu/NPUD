@@ -295,7 +295,7 @@ void NpuWatchProcess::updateFileSaveInfo(time_t timestamp, int64_t frequency, in
 
 void NpuWatchProcess::onIQDataReceived(time_t timestamp, int64_t frequency, int bandwidth, const int samplerate, const float* ddc_iq, const size_t ddc_samples) {
     double sample_time = ddc_samples / (double)samplerate;
-    double power_level = getPowerLevel(ddc_iq, ddc_samples);
+    double power_level = getPowerLevel(ddc_iq, ddc_samples) - 175.0;
 
     if (_state == EnWatchState::DEAD) {
         if (power_level > _watch_req.threshold) {

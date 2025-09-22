@@ -1,4 +1,4 @@
-// NpuPlayAudioJob.cpp  (PATCH-2: lock RTP SR to constant 44.1kHz + 10ms fixed frames) 250919 03:36
+// NpuPlayAudioJob.cpp  (PATCH-2.2: lock RTP SR to constant 44.1kHz + 10ms fixed frames + robust stop chain) 250922 09:05 KST
 
 #include "NpuPlayAudioJob.h"
 
@@ -28,15 +28,123 @@
 #include <cstdint>   // [ADD] for uint16_t>
 #include <chrono>    // [ADD] prefill 대기 시간 지정
 #include <boost/thread.hpp>
+#include <iomanip>
+#include <sstream>
+
+
+
+// ========== [ADD] 초간단 로그 유틸 ==========
+static inline std::string _NowTs() {
+    using namespace std::chrono;
+    auto t  = system_clock::now();
+    auto tt = system_clock::to_time_t(t);
+    auto ms = duration_cast<milliseconds>(t.time_since_epoch()) % 1000;
+    std::tm tm{};
+#ifdef _WIN32
+    localtime_s(&tm, &tt);
+#else
+    localtime_r(&tt, &tm);
+#endif
+    std::ostringstream oss;
+    oss << std::put_time(&tm, "%F %T") << "." << std::setw(3) << std::setfill('0') << ms.count();
+    return oss.str();
+}
+#define LOGI(fmt, ...) do { std::fprintf(stderr, "[%s][I][tid=%zu] " fmt "\n", _NowTs().c_str(), (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), ##__VA_ARGS__ ); } while(0)
+#define LOGW(fmt, ...) do { std::fprintf(stderr, "[%s][W][tid=%zu] " fmt "\n", _NowTs().c_str(), (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), ##__VA_ARGS__ ); } while(0)
+#define LOGE(fmt, ...) do { std::fprintf(stderr, "[%s][E][tid=%zu] " fmt "\n", _NowTs().c_str(), (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), ##__VA_ARGS__ ); } while(0)
 
 // ========== [ADD] 파일 스코프: ServerMediaSession 보관(헤더 수정 없이 누수 방지) ==========
 static ServerMediaSession* g_sms = nullptr;
 
+// ========== [ADD] 종료 요약/진행 플래그 ==========
+static std::atomic<bool> g_rtspLoopStopped{false};
+static std::atomic<bool> g_serverThreadJoined{false};
+static std::atomic<bool> g_sessionClosed{false};
+static std::atomic<bool> g_rtspClosed{false};
+static std::atomic<bool> g_envReclaimed{false};
+static std::atomic<bool> g_schedulerDeleted{false};
+static std::atomic<bool> g_workerJoined{false};
+// 재진입 방지(헤더 수정 없이 파일 스코프)
+static std::atomic<bool> g_shuttingDown{false};
+
 // ===== (ADD) RTP/PCM 고정 샘플레이트 지정: 44,100 Hz =====
 static constexpr unsigned kPCM_OUT_SR = 44100;
-
 static constexpr unsigned kPCM_FRAME_MS = 10;
 static constexpr size_t   kPCM_SAMPLES_PER_FRAME = (kPCM_OUT_SR * kPCM_FRAME_MS) / 1000;  // == 441
+
+// event-loop watch var
+static volatile char g_watchStop = 0;
+
+// ========== [ADD] 루프 스레드에서 watch-var를 set 하는 태스크 ==========
+static void _StopLoopTask(void* /*clientData*/) {
+    LOGI("[RTSP] _StopLoopTask fired on event-loop thread");
+    g_watchStop = (char)0xFF;
+}
+
+// ========== [ADD] 추가 트리거/유틸 ==========
+static EventTriggerId g_shutdownTrigger = 0;
+
+static void _Noop(void*) {}
+static inline void _PokeLoop(BasicTaskScheduler* sched, UsageEnvironment* env, EventTriggerId trig) {
+    if (env && trig != 0) env->taskScheduler().triggerEvent(trig, nullptr);
+    if (sched && trig != 0) sched->triggerEvent(trig, nullptr); // 동일 효과, 추가 보강
+    if (env) env->taskScheduler().scheduleDelayedTask(0, (TaskFunc*)_StopLoopTask, nullptr); // 같은 스레드에서 watch set
+}
+
+// ========== [ADD] select() 영구 block 방지용 주기 틱(100ms) ==========
+static void _Tick(void* clientData) {
+    auto* env = static_cast<UsageEnvironment*>(clientData);
+    // 가벼운 주기 예약만; 로그 없이 계속 재등록
+    env->taskScheduler().scheduleDelayedTask(100000 /*100ms*/, (TaskFunc*)_Tick, clientData);
+}
+
+
+
+static void _ShutdownOnLoopTask(void* clientData) {
+    auto* self = static_cast<NpuPlayAudioJob*>(clientData);
+    if (!self) return;
+    if (g_shuttingDown.exchange(true)) return;
+
+    LOGI("[RTSP] shutdownOnLoop(): begin");
+
+    // if (self->_rtspServer && g_sms) {
+    //     // LOGI("[RTSP] closeAllClientSessionsForServerMediaSession()");
+    //     // self->_rtspServer->closeAllClientSessionsForServerMediaSession(g_sms);
+
+    //     // LOGI("[RTSP] removeServerMediaSession()");
+    //     // self->_rtspServer->removeServerMediaSession(g_sms);
+
+    //     // ❌ 지우세요: g_sms->deleteAllSubsessions();
+
+    //     LOGI("[RTSP] Medium::close(g_sms)");
+    //     ServerMediaSession* sms = g_sms;
+    //     g_sms->close();
+    //     g_sms = nullptr;
+    //     Medium::close(sms);
+    //     g_sessionClosed = true;
+    // } else if (g_sms) {
+    //     // 서버가 이미 nullptr이어도 소유권은 우리에게 있음
+    //     LOGI("[RTSP] Medium::close(g_sms) (server is null)");
+    //     ServerMediaSession* sms = g_sms;
+    //     g_sms = nullptr;
+    //     Medium::close(sms);
+    //     g_sessionClosed = true;
+    // }
+
+    if (self->_rtspServer) {
+        LOGI("[RTSP] Medium::close(_rtspServer)");
+        Medium::close(self->_rtspServer);
+        self->_rtspServer = nullptr;
+        g_rtspClosed = true;
+    }
+
+    // 같은 루프 스레드에서 watch-var set → 안전 탈출
+    _StopLoopTask(nullptr);
+    LOGI("[RTSP] shutdownOnLoop(): end");
+}
+
+
+
 
 // ---------------- FMDemod ----------------------------------------------------
 class FMDemod {
@@ -354,39 +462,6 @@ public:
         , _warmedUp(false)            // [ADD]
         {}
 
-    // // 10ms 고정 프레임(= 4410 samples @ 44.1kHz). 부족분은 0 패딩.
-    // bool getNextFrame(std::vector<short>& buffer) override {
-    //     boost::lock_guard<boost::mutex> lock(_mtx);
-
-    //     if (!_isStarted) return false;
-
-    //     // 150ms 워밍업 버퍼가 쌓일 때까지 재생 보류
-    //     const size_t warmupSamples =
-    //         static_cast<size_t>((uint64_t)_out_samplerate * 150ULL / 1000ULL);
-    //     if (!_warmedUp) {
-    //         if (_data.size() < warmupSamples) return false; // 5ms 뒤 재시도(PCMFramedSource에서)
-    //         _warmedUp = true;
-    //     }
-
-    //     // const size_t want = static_cast<size_t>(
-    //     //     (uint64_t)_out_samplerate * _frame_ms / 1000ULL); // 441000
-
-    //     // ★ 441 샘플 고정
-    //     const size_t want = kPCM_SAMPLES_PER_FRAME; // 441
-    //     buffer.resize(want);
-
-    //     const size_t n = std::min(_data.size(), want);
-    //     for (size_t i = 0; i < n; ++i) {
-    //         buffer[i] = _data.front();
-    //         _data.pop_front();
-    //     }
-    //     // 부족분 0 패딩 → 항상 10ms 길이 보장
-    //     for (size_t i = n; i < want; ++i) {
-    //         buffer[i] = 0;
-    //     }
-    //     return true;
-    // }
-
     // 10ms 고정 프레임(= 441 samples @ 44.1kHz). 
     // 부족하면 false 반환 → PCMFramedSource가 1ms 뒤 재시도
     bool getNextFrame(std::vector<short>& buffer) override {
@@ -432,8 +507,14 @@ public:
     time_t getDuration() override { return _offset / _samplerate; }
     void reset() { _offset = 0; }
 
-    void onInitialized() override { _isStarted = true; }
-    void onClosed() override      { _isStarted = false; }
+    void onInitialized() override { 
+        _isStarted = true; 
+        LOGI("[DemodConduit] onInitialized (in=%u -> out=%u)", _samplerate, _out_samplerate);
+    }
+    void onClosed() override      { 
+        _isStarted = false; 
+        LOGI("[DemodConduit] onClosed");
+    }
     void onReadFrame(int, int) override {}
 
     void onFullBuffer(time_t /*ts*/, float* ddc_iq, size_t ddc_samples) override {
@@ -572,6 +653,14 @@ protected:
         _nextPTS.tv_sec = 0; _nextPTS.tv_usec = 0;
     }
 
+    // [ADD] 지연 태스크 안전 취소
+    ~PCMFramedSource() override {
+        if (nextTask() != 0) {
+            envir().taskScheduler().unscheduleDelayedTask(nextTask());
+            nextTask() = 0;
+        }
+    }
+
 private:
     void doGetNextFrame() override {
         nextTask() = envir().taskScheduler().scheduleDelayedTask(
@@ -583,11 +672,11 @@ private:
         if (!_pcm_source->getNextFrame(next_frame)) {
             // live555 delay 단위는 µs
             nextTask() = envir().taskScheduler().scheduleDelayedTask(
-                1000 /* 5ms */, (TaskFunc*)s_deliverFrame, this);
+                1000 /* 1ms */, (TaskFunc*)s_deliverFrame, this);
             return;
         }
 
-    // 기대 프레임 샘플수(441)와 바이트수(882)
+        // 기대 프레임 샘플수(441)와 바이트수(882)
         const size_t expectedSamples = kPCM_SAMPLES_PER_FRAME; // 441
         const size_t expectedBytes   = expectedSamples * sizeof(short); // 882
 
@@ -597,36 +686,21 @@ private:
         // 수신자 버퍼 한계 반영 (샘플(2바이트) 경계로 정렬)
         size_t bytesToSend = totalBytes;
 
-         // ★ fMaxSize가 882보다 작으면 잘림 → 가능한 만큼만 보냄 (로그 추천)
         if (fMaxSize < expectedBytes) {
-            // envir() << "[PCM] WARN: fMaxSize(" << fMaxSize << ") < 882; truncating\n";
             bytesToSend = fMaxSize & ~static_cast<size_t>(1); // 샘플경계 정렬
             fNumTruncatedBytes = (unsigned)(totalBytes > bytesToSend ? totalBytes - bytesToSend : 0);
         } else {
-            // 정상: 441 샘플만 송출 (혹시 next_frame이 더 커도 441로 제한)
             bytesToSend = expectedBytes;
             fNumTruncatedBytes = (unsigned)(totalBytes > bytesToSend ? totalBytes - bytesToSend : 0);
         }
 
-
-        // if (bytesToSend > fMaxSize) {
-        //     size_t clipped = fMaxSize & ~static_cast<size_t>(1);
-        //     fNumTruncatedBytes = (unsigned)(totalBytes - clipped);
-        //     bytesToSend = clipped;
-        // } else {
-        //     fNumTruncatedBytes = 0;
-        // }
-
-        // 실제 보낼 샘플 수 (모노 16-bit PCM → 2바이트/샘플)
         size_t samplesToSend = bytesToSend / 2;
 
-        // (요청에 따라) 오더링 변환 부분은 기존 구현을 그대로 유지
         const uint16_t* src = reinterpret_cast<const uint16_t*>(next_frame.data());
         uint8_t* dst = fTo;
 
         for (size_t i = 0; i < samplesToSend; ++i) {
             uint16_t u = src[i];
-            // (기존 구현 유지)
             dst[2 * i    ] = static_cast<uint8_t>(u & 0xFF);
             dst[2 * i + 1] = static_cast<uint8_t>(u >> 8);
         }
@@ -756,17 +830,29 @@ NpuPlayAudioJob::NpuPlayAudioJob(const NpuPlayAudioRequest& play_audio_req, NpuC
     , _rtsp_port(rtsp_port)
     , _data_storage_info(std::move(data_storage_info)) {
     _rtsp_ip = _config->getValue("RTSP.IPADDRESS");
+
+    // [ADD] 요약 플래그 초기화
+    g_rtspLoopStopped   = false;
+    g_serverThreadJoined= false;
+    g_sessionClosed     = false;
+    g_rtspClosed        = false;
+    g_envReclaimed      = false;
+    g_schedulerDeleted  = false;
+    g_workerJoined      = false;
+    g_shuttingDown      = false;
 }
 
 NpuPlayAudioJob::~NpuPlayAudioJob() {}
 
 void NpuPlayAudioJob::startRtspServer(IPCMSource* pcm_source) {
+    LOGI("[RTSP] startRtspServer: creating env/scheduler/server");
     _scheduler = BasicTaskScheduler::createNew(0);
     _env = BasicUsageEnvironment::createNew(*_scheduler);
 
     _rtspServer = RTSPServer::createNew(*_env, _rtsp_port);
     if (_rtspServer == nullptr) {
         *_env << "Failed to create RTSP server: " << _env->getResultMsg() << "\n";
+        LOGE("[RTSP] Failed to create server: %s", _env->getResultMsg());
         return;
     }
 
@@ -779,14 +865,27 @@ void NpuPlayAudioJob::startRtspServer(IPCMSource* pcm_source) {
     g_sms = sms;
 
     *_env << "Play this stream using the URL: rtsp://" << _rtsp_ip.c_str() << ":" << _rtsp_port << "/" << streamName << "\n";
+    LOGI("[RTSP] ready: rtsp://%s:%d/%s", _rtsp_ip.c_str(), _rtsp_port, streamName);
 
-    _stopLoop = false;
-    _serverThread = std::thread([this]() {
-        _env->taskScheduler().doEventLoop((char*)&_stopLoop);
+    _stopTrigger = _env->taskScheduler().createEventTrigger(_StopLoopTask);
+    g_shutdownTrigger = _env->taskScheduler().createEventTrigger(_ShutdownOnLoopTask);
+
+    g_watchStop = 0;
+    g_rtspLoopStopped = false;
+
+    _serverThread = std::thread([this]() {        
+        // select 영구 block 방지용 keep-alive tick
+        _env->taskScheduler().scheduleDelayedTask(100000, (TaskFunc*)_Tick, _env);
+
+        LOGI("[RTSP] event loop enter");
+        _env->taskScheduler().doEventLoop(&g_watchStop);
+        LOGI("[RTSP] event loop exit");
+        g_rtspLoopStopped = true;
     });
 }
 
 void NpuPlayAudioJob::work() {
+    LOGI("[Job] work() begin");
     float level_offset = static_cast<float>(atof(_config->getValue("DATA.LEVEL_OFFSET").c_str()));
     
     DDCExecutor ddc_exe;
@@ -795,16 +894,8 @@ void NpuPlayAudioJob::work() {
                          _play_audio_req.frequency,
                          _play_audio_req.bandwidth,
                          _data_storage_info.get())) {
+        LOGE("[Job] initDDC failed");
         return;
-    }
-
-    // [NOTE] 프리필 주석과 달리 현재 10% 대기 (필요시 조정)
-    {
-        // const size_t cap = ddc_exe.ringCapacity();
-        // if (cap > 0) {
-        //     const size_t want = (cap + 4)  * 0.1;
-        //     ddc_exe.waitUntilReadable(want, std::chrono::seconds(2));
-        // }
     }
 
     int samplerate = ddc_exe.getChannelSamplerate();
@@ -820,14 +911,12 @@ void NpuPlayAudioJob::work() {
     else if (_play_audio_req.demod_type == "USB") demodulator = &usb_demodulator;
     else if (_play_audio_req.demod_type == "LSB") demodulator = &lsb_demodulator;
 
-    // (새 메서드가 없으면 현재 로직 기준으로 고정 판단)
     int effective_in_sr = samplerate;
-    //if(true) {
-    if (ddc_exe.getDecimateRate() == 64) {        // <-- 없으면 간단한 getter 하나 추가
+    if (ddc_exe.getDecimateRate() == 64) { // 단순 예시
         effective_in_sr /= 2;
     }
 
-    DemodConduit demod_conduit(effective_in_sr,//samplerate,
+    DemodConduit demod_conduit(effective_in_sr,
                                demodulator,
                                _play_audio_req.squelch_mode, 
                                _play_audio_req.squelch_threshold, 
@@ -846,8 +935,12 @@ void NpuPlayAudioJob::work() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    // 정리: DDCExecutor 종료 (리더 스레드 포함)
-    //ddc_exe.stop();
+    // [ADD] 세션 정리 완료까지 잠시 대기하여 소스 수명 보장
+    for (int i = 0; i < 50 && !g_sessionClosed.load(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // 정리: DDCExecutor 종료
     ddc_exe.close();
 }
 
@@ -856,47 +949,159 @@ std::string NpuPlayAudioJob::start(JOB_COMPLEDTED_CALLBACK completed_callback) {
     _guid = generateID();
     _completed_callback = completed_callback;
     _running = true;
+    LOGI("[Job] start(): guid=%s", _guid.c_str());
     _thread.reset(new std::thread(std::bind(&NpuPlayAudioJob::work, shared_from_this())));
     return _guid;
 }
 
+// void NpuPlayAudioJob::stop() {
+//     LOGI("[Job] stop() requested");
+//     {
+//         boost::lock_guard<boost::mutex> lock(_mtx);
+//         if (!_running) LOGW("[Job] stop(): already stopped");
+//         _running = false;
+//     }
+
+//     // ========== 1) 루프 스레드에 “종료 작업” 예약 (세션/서버 정리 + watch-var set) ==========
+//     if (_env) {
+//         LOGI("[RTSP] scheduleDelayedTask(0, _ShutdownOnLoopTask)");
+//         _env->taskScheduler().scheduleDelayedTask(0, (TaskFunc*)_ShutdownOnLoopTask, this);
+//     }
+
+//     // 루프 스레드를 즉시 깨워 ShutdownOnLoopTask가 실행되도록 유도
+//     if (_env && _stopTrigger != 0) {
+//         LOGI("[RTSP] triggerEvent(id=%u) for StopLoopTask", (unsigned)_stopTrigger);
+//         _env->taskScheduler().triggerEvent(_stopTrigger, this);
+//     }
+
+//     // ========== 2) 서버 스레드 조인 (doEventLoop 탈출 대기) ==========
+//     if (_serverThread.joinable()) {
+//         if (std::this_thread::get_id() == _serverThread.get_id()) {
+//             LOGE("[RTSP] stop() called from server thread; skip join to avoid self-join deadlock");
+//         } else {
+//             LOGI("[RTSP] joining server thread...");
+//             _serverThread.join();
+//             g_serverThreadJoined = true;
+//             LOGI("[RTSP] server thread joined (rtspLoopStopped=%s)", g_rtspLoopStopped ? "true":"false");
+//         }
+//     } else {
+//         LOGW("[RTSP] server thread not joinable");
+//     }
+
+//     // ========== 3) 트리거 정리 ==========
+//     if (_env && _stopTrigger != 0) {
+//         LOGI("[RTSP] deleteEventTrigger(id=%u)", (unsigned)_stopTrigger);
+//         _env->taskScheduler().deleteEventTrigger(_stopTrigger);
+//         _stopTrigger = 0;
+//     }
+
+//     // ========== 4) env/scheduler 정리 (항상 마지막) ==========
+//     if (_env) {
+//         LOGI("[RTSP] reclaim _env");
+//         _env->reclaim();
+//         _env = nullptr;
+//         g_envReclaimed = true;
+//     }
+//     if (_scheduler) {
+//         LOGI("[RTSP] delete _scheduler");
+//         delete _scheduler;
+//         _scheduler = nullptr;
+//         g_schedulerDeleted = true;
+//     }
+
+//     // ========== 5) 작업 스레드 종료(마지막) ==========
+//     wait();
+//     g_workerJoined = true;
+
+//     // 콜백 통지 (있다면)
+//     if (_completed_callback) {
+//         LOGI("[Job] invoking completed_callback(guid=%s)", _guid.c_str());
+//         try { _completed_callback(_guid); } catch (...) { LOGE("[Job] completed_callback threw"); }
+//     }
+
+//     LOGI("[Job] shutdown summary:"
+//          " rtspLoopStopped=%s, serverThreadJoined=%s, sessionClosed=%s, rtspClosed=%s, envReclaimed=%s, schedulerDeleted=%s, workerJoined=%s",
+//          g_rtspLoopStopped ? "true":"false",
+//          g_serverThreadJoined ? "true":"false",
+//          g_sessionClosed ? "true":"false",
+//          g_rtspClosed ? "true":"false",
+//          g_envReclaimed ? "true":"false",
+//          g_schedulerDeleted ? "true":"false",
+//          g_workerJoined ? "true":"false");
+// }
+
 void NpuPlayAudioJob::stop() {
+    LOGI("[Job] stop() requested");
     {
         boost::lock_guard<boost::mutex> lock(_mtx);
+        if (!_running) LOGW("[Job] stop(): already stopped");
         _running = false;
     }
 
-    // 종료 순서 고정: 1) 루프 종료 → 2) event loop 종료/조인 → 3) Medium::close
-    _stopLoop = true;
+    // // 1) 루프 스레드에서 종료 로직 실행: cross-thread safe 경로(트리거)로만 깨운다
+    // if (_env && g_shutdownTrigger != 0) {
+    //     LOGI("[RTSP] triggerEvent(g_shutdownTrigger)");
+    //     _env->taskScheduler().triggerEvent(g_shutdownTrigger, this);
+    // }
+    // // watch-var 갱신 트리거도 함께
+    // if (_env && _stopTrigger != 0) {
+    //     LOGI("[RTSP] triggerEvent(_stopTrigger)");
+    //     _env->taskScheduler().triggerEvent(_stopTrigger, this);
+    // }
 
+    // after: _stopTrigger는 건드리지 않습니다. g_shutdownTrigger만!
+    if (_env && g_shutdownTrigger != 0) {
+        LOGI("[RTSP] triggerEvent(g_shutdownTrigger) (only)");
+        _env->taskScheduler().triggerEvent(g_shutdownTrigger, this);
+    }
+
+
+    // 2) 서버 스레드 조인 (반드시 doEventLoop 반환 후)
     if (_serverThread.joinable()) {
-        _serverThread.join();
+        if (std::this_thread::get_id() == _serverThread.get_id()) {
+            LOGE("[RTSP] stop() called from server thread; skip join to avoid self-join deadlock");
+        } else {
+            LOGI("[RTSP] joining server thread...");
+            _serverThread.join();
+            g_serverThreadJoined = true;
+            LOGI("[RTSP] server thread joined (rtspLoopStopped=%s)", g_rtspLoopStopped ? "true":"false");
+        }
+    } else {
+        LOGW("[RTSP] server thread not joinable");
     }
 
-    if (g_sms) {
-        Medium::close(g_sms);
-        g_sms = nullptr;
-    }
-    if (_rtspServer) {
-        Medium::close(_rtspServer);
-        _rtspServer = nullptr;
-    }
-
+    // 3) 트리거 정리
     if (_env) {
-        _env->reclaim();
-        _env = nullptr;
-    }
-    if (_scheduler) {
-        delete _scheduler;
-        _scheduler = nullptr;
+        if (_stopTrigger != 0) {
+            LOGI("[RTSP] deleteEventTrigger(id=%u)", (unsigned)_stopTrigger);
+            _env->taskScheduler().deleteEventTrigger(_stopTrigger);
+            _stopTrigger = 0;
+        }
+        if (g_shutdownTrigger != 0) {
+            LOGI("[RTSP] deleteEventTrigger(g_shutdownTrigger)");
+            _env->taskScheduler().deleteEventTrigger(g_shutdownTrigger);
+            g_shutdownTrigger = 0;
+        }
     }
 
-    // 작업 스레드 종료(마지막)
-    wait();
+    // 4) env/scheduler 정리 (항상 마지막)
+    if (_env) { LOGI("[RTSP] reclaim _env"); _env->reclaim(); _env = nullptr; g_envReclaimed = true; }
+    if (_scheduler) { LOGI("[RTSP] delete _scheduler"); delete _scheduler; _scheduler = nullptr; g_schedulerDeleted = true; }
+
+    // 5) 작업 스레드 종료
+    wait(); g_workerJoined = true;
+
+    if (_completed_callback) { LOGI("[Job] invoking completed_callback(guid=%s)", _guid.c_str()); try { _completed_callback(_guid); } catch (...) { LOGE("[Job] completed_callback threw"); } }
+
+    LOGI("[Job] shutdown summary: rtspLoopStopped=%s, serverThreadJoined=%s, sessionClosed=%s, rtspClosed=%s, envReclaimed=%s, schedulerDeleted=%s, workerJoined=%s",
+        g_rtspLoopStopped ? "true":"false", g_serverThreadJoined ? "true":"false", g_sessionClosed ? "true":"false",
+        g_rtspClosed ? "true":"false", g_envReclaimed ? "true":"false", g_schedulerDeleted ? "true":"false", g_workerJoined ? "true":"false");
 }
 
 void NpuPlayAudioJob::wait() {
     if (_thread && _thread->joinable()) {
+        LOGI("[Job] joining worker thread...");
         _thread->join();
+        LOGI("[Job] worker thread joined");
     }
 }

@@ -455,7 +455,7 @@ std::string NpuExtractJob::start(JOB_COMPLEDTED_CALLBACK completed_callback) {
 }
 
 void NpuExtractJob::stop() {
-    _ddc_exe.stop();
+    _ddc_exe.close();
 }
 
 void NpuExtractJob::wait() {
