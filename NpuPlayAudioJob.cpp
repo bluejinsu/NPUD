@@ -593,7 +593,7 @@ public:
 
         auto fut = std::async(std::launch::async, [this]() {
             while (_ddc_exe->getRunning()) {
-                bool didWork = _ddc_exe->executeDDC(_ddc_handler);
+                bool didWork = _ddc_exe->executeDDC(_ddc_handler, 0);
                 if (!didWork) std::this_thread::sleep_for(std::chrono::milliseconds(2));
             }
             _ddc_handler->onClosed();

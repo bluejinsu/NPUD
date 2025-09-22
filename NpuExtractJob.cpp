@@ -180,7 +180,7 @@ std::unique_ptr<NpuExtractResult> NpuExtractJob::extractIQ(const DataStorageInfo
         constexpr int kIdleSleepMs               = 2;    // 재확인 간격(ms)
 
         while (_ddc_exe.getRunning()) {
-            bool didWork = _ddc_exe.executeDDC(this);
+            bool didWork = _ddc_exe.executeDDC(this, 2);
 
             if (!didWork) {
                 // ioDone + ringEmpty → 짧은 재확인 루프

@@ -99,7 +99,7 @@ void NpuWatchJob::extractIQ(const DataStorageInfo* dat_storage_info) {
         constexpr int kIdleSleepMs               = 2;    // 재확인 간격(ms)
 
         while (_running && _ddc_exe.getRunning()) {
-            bool didWork = _ddc_exe.executeDDC(this);
+            bool didWork = _ddc_exe.executeDDC(this, 1);
 
             if (!didWork) {
                 // ioDone + ringEmpty → 짧은 재확인 루프

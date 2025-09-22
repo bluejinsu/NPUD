@@ -158,7 +158,9 @@ private:
 public:
     DDCExecutor();
     ~DDCExecutor();
-    
+    enum { DDC_EXEC_AUDIO=0, DDC_EXEC_WATCH=1, DDC_EXEC_EXTRACT=2 };
+    bool executeDDC(IDDCHandler* ddc_handler, int type);
+
     bool initDDC(const time_t starttime, const time_t endtime, const int64_t frequency, const int bandwidth, const DataStorageInfo* dat_storage_info);
     bool initSecondaryDDC(const time_t starttime, const time_t endtime, const int64_t frequency, const int bandwidth, const DataStorageInfo* dat_storage_info);
     bool executeDDC(IDDCHandler* ddc_handler);
