@@ -47,6 +47,8 @@ private:
     NpuConfigure* _config;
 
     boost::mutex _mtx;
+	boost::mutex _fut_mtx;  // protects _futures
+	std::atomic<bool> _isShuttingDown{false};  // 중복 shutdown 방지
     std::map<std::string, std::shared_ptr<NpuExtractJob>> _ext_job_container;
     std::map<std::string, std::shared_ptr<NpuWatchJob>> _watch_job_cotainer;
     std::vector<std::future<void>> _futures;

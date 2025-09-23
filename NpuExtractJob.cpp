@@ -426,7 +426,7 @@ NpuExtractJob::NpuExtractJob(const NpuExtractRequest& ext_req, NpuConfigure* con
     _ext_info.starttime = ext_req.starttime;
     _ext_info.endtime = ext_req.endtime;
 	_ext_info.progress = 0;
-
+    _ext_info.guid = generateID(); // ← 여기로 이동
     // memset(&_config_data, 0, sizeof(_config_data));
 }
 
@@ -441,7 +441,7 @@ std::string NpuExtractJob::start(JOB_COMPLEDTED_CALLBACK completed_callback) {
 
     loadConfig();
 
-    _ext_info.guid = generateID();
+    //_ext_info.guid = generateID();
     _completed_callback = completed_callback;
 	_running = true;
 	_thread.reset(new std::thread(std::bind(&NpuExtractJob::work, shared_from_this())));
