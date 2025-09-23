@@ -223,7 +223,7 @@ std::unique_ptr<NpuExtractResult> NpuExtractJob::extractIQ(const DataStorageInfo
     ext_result->frequency = _ext_info.frequency;
     ext_result->samplerate = channel_samplerate;
     ext_result->bandwidth = channel_bandwidth;
-    ext_result->power_level = _max_channel_power;
+    ext_result->power_level = _max_channel_power - 175.0;
 
     return ext_result;
 } 
