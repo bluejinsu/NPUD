@@ -445,15 +445,15 @@ public:
 
         if (!_isStarted) return false;
 
-        // 150ms 워밍업 버퍼가 쌓일 때까지 재생 보류
-        const size_t warmupSamples =
-            static_cast<size_t>((uint64_t)_out_samplerate * 150ULL / 1000ULL);
-        if (!_warmedUp) {
-            if (_data.size() < warmupSamples) {
-                return false; // 워밍업 완료 전: 재시도
-            }
-            _warmedUp = true;
-        }
+        // // 150ms 워밍업 버퍼가 쌓일 때까지 재생 보류
+        // const size_t warmupSamples =
+        //     static_cast<size_t>((uint64_t)_out_samplerate * 150ULL / 1000ULL);
+        // if (!_warmedUp) {
+        //     if (_data.size() < warmupSamples) {
+        //         return false; // 워밍업 완료 전: 재시도
+        //     }
+        //     _warmedUp = true;
+        // }
 
         // ★ 441 샘플 고정
         const size_t want = kPCM_SAMPLES_PER_FRAME; // 441

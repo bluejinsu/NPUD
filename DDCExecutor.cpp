@@ -201,7 +201,7 @@ bool DDCExecutor::initDDC(const time_t starttime, const time_t endtime, const in
     body_size = frame_samples * sizeof(int16_t) * 2;    // IQ(int16*2) per frame
     frame_count_in_file = 256;                          // 256
 
-    samples = frame_samples * 32;                       // 기존 유지
+    samples = frame_samples * 1;                       // 32 기존 유지
     ddc_sample_size = samples * sizeof(int16_t) * 2;
     ddc_short_sample_size = ddc_sample_size;
 
