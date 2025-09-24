@@ -52,7 +52,7 @@ static inline std::string _NowTs_DDC() {
 
 // ====== [ADD-STEP1/2] Feature toggles ======
 #define FEAT_POSIX_IO        0   // 1단계: fstream → POSIX open/read + fadvise
-#define FEAT_CHUNKED_4MB     1   // 2단계: 4MB 고정 청크로 바디를 모아 한 번에 링 write
+#define FEAT_CHUNKED_4MB     0   // 2단계: 4MB 고정 청크로 바디를 모아 한 번에 링 write
 
 #if FEAT_POSIX_IO
   #include <fcntl.h>
