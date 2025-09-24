@@ -423,7 +423,7 @@ private:
 // ---------------- DemodConduit ----------------------------------------------
 class DemodConduit : public IDDCHandler, public IPCMSource {
 public:
-    DemodConduit(unsigned int samplerate, IDemodulator* demodulator, bool squelch_mode, float squelch_threshold, float scale, float level_offset)
+    DemodConduit(unsigned int samplerate, unsigned int postM, IDemodulator* demodulator, bool squelch_mode, float squelch_threshold, float scale, float level_offset)
         : _samplerate(samplerate)
         , _out_samplerate(44100) // 고정 출력 샘플레이트
         , _offset(0)
@@ -436,6 +436,7 @@ public:
         , _level_offset(level_offset)
         , _agc(0.01, 17, _out_samplerate/10, 17) 
         , _warmedUp(false)            // [ADD]
+        , _postM(postM)
         {}
 
     // 10ms 고정 프레임(= 441 samples @ 44.1kHz). 
@@ -474,6 +475,7 @@ public:
 
     void setScale(float scale) { _scale = scale; }
     float getScale() { return _scale; }
+    
 
     // 고정 44100
     unsigned getSamplerate() override {
@@ -494,19 +496,49 @@ public:
     void onReadFrame(int, int) override {}
 
     void onFullBuffer(time_t /*ts*/, float* ddc_iq, size_t ddc_samples) override {
+        
+        unsigned out_samples = static_cast<unsigned>(ddc_samples);
+        float*   out_ptr     = ddc_iq;
+        
+        if (_postM > 1u) {
+            const unsigned inN = static_cast<unsigned>(ddc_samples);
+            const unsigned outN = inN / _postM;       // 보통 정확히 나눠떨어짐
+            const float invM = 1.0f / static_cast<float>(_postM);
+
+            _post_buf.resize(static_cast<size_t>(outN) * 2);
+
+            for (unsigned k = 0; k < outN; ++k) {
+                const unsigned baseIn = k * _postM;   // 복소샘플 인덱스
+                float accI = 0.0f, accQ = 0.0f;
+                for (unsigned m = 0; m < _postM; ++m) {
+                    const unsigned i = (baseIn + m) * 2u;
+                    accI += ddc_iq[i];
+                    accQ += ddc_iq[i + 1u];
+                }
+                _post_buf[2u * k]     = accI * invM;
+                _post_buf[2u * k + 1] = accQ * invM;
+            }
+
+            out_samples = outN;
+            out_ptr     = _post_buf.data();
+        }
+        
         // 1) 로컬/멤버 재사용 버퍼로 처리(락 없이)
-        std::vector<float> demod_data;      demod_data.reserve(ddc_samples);
-        std::vector<float> auto_gain_data;  auto_gain_data.reserve(ddc_samples);
+        std::vector<float> demod_data;      demod_data.reserve(out_samples);
+        std::vector<float> auto_gain_data;  auto_gain_data.reserve(out_samples);
+        // std::vector<float> demod_data;      demod_data.reserve(ddc_samples);
+        // std::vector<float> auto_gain_data;  auto_gain_data.reserve(ddc_samples);
+
 
         if (_squelch_mode) {
             const double p = getPowerLevel(ddc_iq, ddc_samples);
             if (p < _squelch_threshold) {
-                demod_data.assign(ddc_samples, 0.0f);
+                demod_data.assign(out_samples, 0.0f);
             } else {
-                _demodulator->demodulate(ddc_iq, ddc_samples, demod_data);
+                _demodulator->demodulate(out_ptr, out_samples, demod_data);
             }
         } else {
-            _demodulator->demodulate(ddc_iq, ddc_samples, demod_data);
+            _demodulator->demodulate(out_ptr, out_samples, demod_data);
         }
 
         auto_gain_data.resize(demod_data.size());
@@ -530,7 +562,7 @@ private:
     std::deque<short> _out_ring;  // (사용 안함)
     const unsigned _frame_ms = 10;    
     bool _warmedUp;  // [ADD]
-
+    unsigned int _postM = 1;
     double getPowerLevel(float* ddc_iq, size_t ddc_samples) {
         FFTExecutor fft_executor;
         const int N = static_cast<int>(ddc_samples);              // [CHANGE] 실제 길이
@@ -577,6 +609,7 @@ private:
     float _squelch_threshold;
     float _level_offset;
     AutoGainControl _agc;
+    std::vector<float> _post_buf; // [KEEP] persistent secondary buffer (I,Q interleaved)
 };
 
 // ---------------- DDCRunner --------------------------------------------------
@@ -879,7 +912,8 @@ void NpuPlayAudioJob::work() {
     }
 
     int samplerate = ddc_exe.getChannelSamplerate();
-
+    int decirate = ddc_exe.getDecimateRate();
+    int effective_in_sr = samplerate;
     FMDemodulator fm_demodulator;
     AMDemodulator  am_demodulator;
     USBDemodulator usb_demodulator;
@@ -890,13 +924,24 @@ void NpuPlayAudioJob::work() {
     else if (_play_audio_req.demod_type == "AM")  demodulator = &am_demodulator;
     else if (_play_audio_req.demod_type == "USB") demodulator = &usb_demodulator;
     else if (_play_audio_req.demod_type == "LSB") demodulator = &lsb_demodulator;
+    
+    // if (ddc_exe.getDecimateRate() == 64) { // 단순 예시
+    //     effective_in_sr /= 2;
+    // }
 
-    int effective_in_sr = samplerate;
-    if (ddc_exe.getDecimateRate() == 64) { // 단순 예시
-        effective_in_sr /= 2;
-    }
+    g_postM = 1;
+    if      (decirate == 64) g_postM = 2;
+    else if (decirate == 32) g_postM = 4;
+    else if (decirate == 16) g_postM = 8;
+    else if (decirate == 8) g_postM = 16;
+    else if (decirate == 4) g_postM = 32;
+    else if (decirate == 2) g_postM = 64;
+    else if (decirate == 1) g_postM = 128;
+    else                     g_postM = 1;
+    effective_in_sr /= g_postM;
 
     DemodConduit demod_conduit(effective_in_sr,
+                                g_postM,
                                demodulator,
                                _play_audio_req.squelch_mode, 
                                _play_audio_req.squelch_threshold, 

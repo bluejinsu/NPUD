@@ -255,7 +255,7 @@ bool DDCExecutor::initDDC(const time_t starttime, const time_t endtime, const in
 
         _readerThread = std::thread([this]() { this->readerLoopWithPreopen(); });
     }
-    LOGI("initDDC done: decirate=%d, chFs=%u, ringCap=%zu", _decirate, _channel_samplerate, _ring_capacity);
+    LOGI("initDDC done: bandwidth= %d, decirate=%d, chFs=%u, ringCap=%zu", _bandwidth, _decirate, _channel_samplerate, _ring_capacity);
     return true;
 }
 
@@ -271,18 +271,127 @@ bool DDCExecutor::initSecondaryDDC(const time_t starttime, const time_t endtime,
 }
 
 // ====================== [CHANGE] 오버로드 추가: type으로 모드 구분 ======================
+// bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler, int type /* DDC_EXEC_* */) {
+//     bool processed_any = false;
+
+//     const size_t required_bytes = static_cast<size_t>(ddc_sample_size);
+
+//     std::vector<uint8_t>  batch(required_bytes);
+//     const size_t required_shorts = required_bytes / sizeof(int16_t);
+//     std::vector<int32_t>  input_iq(required_shorts);
+
+//     // 원 신호(float)와 2:1 다운샘플(float) 버퍼를 모두 “루프 바깥”에 둠
+//     std::vector<float>    iq_data_f(static_cast<size_t>(ddc_samples) * 2);
+//     static std::vector<float> post_buf; // [KEEP] persistent secondary buffer (I,Q interleaved)
+
+//     while (_running) {
+//         if (!_ring) break;
+
+//         const bool ok = waitUntilReadable(required_bytes, std::chrono::milliseconds(200));
+
+//         // ioDone 이후 tail 처리
+//         if (!ok) {
+//             if (_ring && ioDone()) {
+//                 const size_t avail = _ring->readable();
+//                 if (avail > 0 && avail < required_bytes) {
+//                     std::fill(batch.begin(), batch.end(), 0);
+//                     size_t got_tail = _ring->read(batch.data(), avail);
+//                     if (got_tail != avail) continue;
+//                 } else {
+//                     break;
+//                 }
+//             } else {
+//                 continue;
+//             }
+//         } else {
+//             size_t got = _ring->read(batch.data(), required_bytes);
+//             if (got < required_bytes) {
+//                 if (ioDone()) continue;
+//                 else continue;
+//             }
+//         }
+
+//         // s16 -> Q31
+//         const int16_t* src16 = reinterpret_cast<const int16_t*>(batch.data());
+//         for (size_t k = 0; k < required_shorts; ++k) {
+//             input_iq[k] = static_cast<int32_t>(src16[k]) << 15;
+//         }
+
+//         // CUDA DDC
+//         master->input(input_iq.data());
+//         master->asyncDecimate();
+//         master->output(_pOutIQComplex);
+//         master->wait();
+
+//         // Q31 -> float
+//         constexpr float kQ31 = 1.0f / 2147483648.0f; // 2^31
+//         for (int k = 0; k < ddc_samples; ++k) {
+//             iq_data_f[2*k]     = _pOutIQComplex[2*k]     * kQ31;
+//             iq_data_f[2*k + 1] = _pOutIQComplex[2*k + 1] * kQ31;
+//         }
+
+//         // [CHANGE] 모드별 postDecim 적용 여부
+//         // AUDIO: 64→2, 32→4, 16→8
+//         // WATCH/EXTRACT: postDecim 강제 1 (추가 다운샘플 금지)
+//         unsigned postDecim = 1u;
+//         if (type == DDC_EXEC_AUDIO) {
+//             if (_decirate == 64u || _decirate == 32u || _decirate == 16u) {
+//                 postDecim = 128u / static_cast<unsigned>(_decirate); // 64→2, 32→4, 16→8
+//             }
+//         } else {
+//             postDecim = 1u; // 강제 비적용
+//         }
+
+//         double eff_fs = static_cast<double>(_fs) / static_cast<double>(_decirate);
+//         eff_fs /= postDecim; // AUDIO만 영향을 받음(위에서 결정됨)
+
+//         unsigned out_samples = static_cast<unsigned>(ddc_samples);
+//         float*   out_ptr     = iq_data_f.data();
+
+//         if (postDecim > 1u) {
+//             const unsigned inN = static_cast<unsigned>(ddc_samples);
+//             const unsigned outN = inN / postDecim;       // 보통 정확히 나눠떨어짐
+//             const float invM = 1.0f / static_cast<float>(postDecim);
+
+//             post_buf.resize(static_cast<size_t>(outN) * 2);
+
+//             for (unsigned k = 0; k < outN; ++k) {
+//                 const unsigned baseIn = k * postDecim;   // 복소샘플 인덱스
+//                 float accI = 0.0f, accQ = 0.0f;
+//                 for (unsigned m = 0; m < postDecim; ++m) {
+//                     const unsigned i = (baseIn + m) * 2u;
+//                     accI += iq_data_f[i];
+//                     accQ += iq_data_f[i + 1u];
+//                 }
+//                 post_buf[2u * k]     = accI * invM;
+//                 post_buf[2u * k + 1] = accQ * invM;
+//             }
+
+//             out_samples = outN;
+//             out_ptr     = post_buf.data();
+//         }
+
+//         // 핸들러 호출 (타임스탬프는 최종 eff_fs 기준)
+//         const int64_t ts_ms = static_cast<int64_t>(_starttime) * 1000
+//                             + static_cast<int64_t>((_read_samples / eff_fs) * 1000.0);
+
+//         ddc_handler->onFullBuffer(static_cast<time_t>(ts_ms), out_ptr, out_samples);
+//         _read_samples += out_samples;
+//         processed_any = true;
+//     }
+//     return processed_any;
+// }
+
 bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler, int type /* DDC_EXEC_* */) {
     bool processed_any = false;
-
     const size_t required_bytes = static_cast<size_t>(ddc_sample_size);
-
     std::vector<uint8_t>  batch(required_bytes);
     const size_t required_shorts = required_bytes / sizeof(int16_t);
     std::vector<int32_t>  input_iq(required_shorts);
 
     // 원 신호(float)와 2:1 다운샘플(float) 버퍼를 모두 “루프 바깥”에 둠
     std::vector<float>    iq_data_f(static_cast<size_t>(ddc_samples) * 2);
-    static std::vector<float> post_buf; // [KEEP] persistent secondary buffer (I,Q interleaved)
+    //static std::vector<float> post_buf; // [KEEP] persistent secondary buffer (I,Q interleaved)
 
     while (_running) {
         if (!_ring) break;
@@ -309,78 +418,42 @@ bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler, int type /* DDC_EXEC_* */
                 if (ioDone()) continue;
                 else continue;
             }
-        }
+        }                
 
-        // s16 -> Q31
-        const int16_t* src16 = reinterpret_cast<const int16_t*>(batch.data());
+        const int16_t* src16 = reinterpret_cast<const int16_t*>(batch.data());                
+
         for (size_t k = 0; k < required_shorts; ++k) {
             input_iq[k] = static_cast<int32_t>(src16[k]) << 15;
         }
 
-        // CUDA DDC
         master->input(input_iq.data());
         master->asyncDecimate();
         master->output(_pOutIQComplex);
         master->wait();
-
-        // Q31 -> float
+        
+        // for (int k = 0; k < ddc_samples; ++k) {
+        //     iq_data_f[2 * k]     = static_cast<float>(_pOutIQComplex[2 * k]);
+        //     iq_data_f[2 * k + 1] = static_cast<float>(_pOutIQComplex[2 * k + 1]);
+        // }
+        
         constexpr float kQ31 = 1.0f / 2147483648.0f; // 2^31
         for (int k = 0; k < ddc_samples; ++k) {
-            iq_data_f[2*k]     = _pOutIQComplex[2*k]     * kQ31;
-            iq_data_f[2*k + 1] = _pOutIQComplex[2*k + 1] * kQ31;
+            iq_data_f[2 * k]     = _pOutIQComplex[2 * k]     * kQ31;
+            iq_data_f[2 * k + 1] = _pOutIQComplex[2 * k + 1] * kQ31;
         }
 
-        // [CHANGE] 모드별 postDecim 적용 여부
-        // AUDIO: 64→2, 32→4, 16→8
-        // WATCH/EXTRACT: postDecim 강제 1 (추가 다운샘플 금지)
-        unsigned postDecim = 1u;
-        if (type == DDC_EXEC_AUDIO) {
-            if (_decirate == 64u || _decirate == 32u || _decirate == 16u) {
-                postDecim = 128u / static_cast<unsigned>(_decirate); // 64→2, 32→4, 16→8
-            }
-        } else {
-            postDecim = 1u; // 강제 비적용
-        }
+        const double effective_fs = static_cast<double>(_fs) / static_cast<double>(_decirate);
+        time_t timestamp = _starttime * 1000.0 + (time_t)((_read_samples / effective_fs) * 1000.0);
 
-        double eff_fs = static_cast<double>(_fs) / static_cast<double>(_decirate);
-        eff_fs /= postDecim; // AUDIO만 영향을 받음(위에서 결정됨)
+        ddc_handler->onFullBuffer(timestamp, iq_data_f.data(), ddc_samples);
+        _read_samples += ddc_samples;
 
-        unsigned out_samples = static_cast<unsigned>(ddc_samples);
-        float*   out_ptr     = iq_data_f.data();
-
-        if (postDecim > 1u) {
-            const unsigned inN = static_cast<unsigned>(ddc_samples);
-            const unsigned outN = inN / postDecim;       // 보통 정확히 나눠떨어짐
-            const float invM = 1.0f / static_cast<float>(postDecim);
-
-            post_buf.resize(static_cast<size_t>(outN) * 2);
-
-            for (unsigned k = 0; k < outN; ++k) {
-                const unsigned baseIn = k * postDecim;   // 복소샘플 인덱스
-                float accI = 0.0f, accQ = 0.0f;
-                for (unsigned m = 0; m < postDecim; ++m) {
-                    const unsigned i = (baseIn + m) * 2u;
-                    accI += iq_data_f[i];
-                    accQ += iq_data_f[i + 1u];
-                }
-                post_buf[2u * k]     = accI * invM;
-                post_buf[2u * k + 1] = accQ * invM;
-            }
-
-            out_samples = outN;
-            out_ptr     = post_buf.data();
-        }
-
-        // 핸들러 호출 (타임스탬프는 최종 eff_fs 기준)
-        const int64_t ts_ms = static_cast<int64_t>(_starttime) * 1000
-                            + static_cast<int64_t>((_read_samples / eff_fs) * 1000.0);
-
-        ddc_handler->onFullBuffer(static_cast<time_t>(ts_ms), out_ptr, out_samples);
-        _read_samples += out_samples;
         processed_any = true;
     }
     return processed_any;
 }
+
+
 
 // ====================== [KEEP] 하위호환: 기존 시그니처는 AUDIO로 위임 ======================
 bool DDCExecutor::executeDDC(IDDCHandler* ddc_handler) {

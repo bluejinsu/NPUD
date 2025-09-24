@@ -48,7 +48,7 @@ private:
 
     // Event trigger id (live555 TaskScheduler::EventTriggerId와 동일한 너비)
     uint32_t _stopTrigger {0};
-
+    unsigned g_postM = 1;
 private:
     void startRtspServer(IPCMSource* ext_demod);
     void work();
